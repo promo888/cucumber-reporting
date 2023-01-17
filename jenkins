@@ -1,0 +1,418 @@
+//report.groovy
+
+#!/usr/bin/env groovy
+import hudson.tasks.test.AbstractTestResultAction
+import hudson.model.Actionable
+def fileContent
+def azureToken
+def emailBody
+
+
+@NonCPS
+def getTestSummary = { ->
+    def testResultAction = currentBuild.rawBuild.getAction(AbstractTestResultAction.class)
+    def summary = ""
+
+    if (testResultAction != null) {
+        def total = testResultAction.getTotalCount()
+        def failed = testResultAction.getFailCount()
+        def skipped = testResultAction.getSkipCount()
+
+        summary = "Test results:\n\t"
+        summary = summary + ("Passed: " + (total - failed - skipped))
+        summary = summary + (", Failed: " + failed)
+        summary = summary + (", Skipped: " + skipped)
+    } else {
+        summary = "No tests found"
+    }
+    return summary
+}
+
+pipeline {
+    options {
+
+        // Console output for the number of recent Pipeline runs
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+
+        // Skip checking out code from source control by default
+        skipDefaultCheckout(true)
+
+        // Generate timestamps for the process procedure
+        timestamps()
+    }
+
+    agent { label 'windows-slave'}
+
+    parameters {
+        string(name: 'jobName',defaultValue: "runTests",description: "the job name that we want results for")
+        string(name: 'numberOfBuilds',defaultValue: "2",description: "number of builds to collect data for")
+        string(name: 'emailRecipients',defaultValue: "RnD_QA@securithings.com arik.e@securithings.com ron.d@securithings.com",description: "Email recipients for daily report")
+        string(name: 'branch',defaultValue: "",description: "number of builds to collect data for")
+    }
+
+    triggers {
+        parameterizedCron('''                
+            59 5 * * * %jobName=runTests;numberOfBuilds=2;branch=master;emailRecipients=RnD_QA@securithings.com arik.e@securithings.com
+            00 6 * * * %jobName=runTests;numberOfBuilds=1;branch=dev;emailRecipients=RnD_QA@securithings.com
+        ''')
+    }
+
+
+    // Clean the job's workspace before starting new one
+    stages {
+
+        stage("pre - clean workspace") {
+            steps {
+                cleanWs()
+            }
+        }
+
+        //Pull from git
+        stage("git") {
+            steps {
+                git branch: "master",
+                        credentialsId: 'stbuilduser-git-credentials',
+                        url: 'ssh://git@logan-01.securithings.com:2224/rnd/qa/horizon-automation.git'
+            }
+        }
+
+        stage("set passwords") {
+            steps {
+                script {
+                    dir("${workspace}") {
+                        def credsId = "JENKINS_CREDS"
+                        println("CREDS == ${credsId}")
+
+                        withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId:'JENKINS_CREDS', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+                            env.PWD=PASSWORD
+                            env.USER=USERNAME
+                        }
+                    }
+                }
+            }
+        }
+
+        stage("Testing") { // Run unit tests
+            steps {
+                script {
+                    println("Running Daily report")
+                    currentBuild.displayName = currentBuild.displayName + "_daily_report"
+
+                    bat "mvn test -Dtest=DailyReport#dailyReport -DjobName=${jobName} -DnumberOfBuilds=${numberOfBuilds}"
+                    //read file dailyReport.html
+                    emailBody = readFile(file: 'dailyReport.html')
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                //email
+                try {
+                    println("DATA BEFORE SEND = ${emailBody}")
+                    emailext body: "${emailBody}",
+                            mimeType: 'text/html',
+                            subject: "Test Automation Results",
+                            to: "${emailRecipients}"
+                }
+                catch(ex){
+                    //echo ${ex}
+                }
+
+                try {
+                    archiveArtifacts artifacts: 'dailyReport.html', fingerprint: true
+                }
+                catch (ex) {
+
+                }
+                step([$class: 'Publisher', reportFilenamePattern: '**/testng-results.xml'])
+            }
+        }
+    }
+}
+
+
+
+//runTests.grrovy
+
+#!/usr/bin/env groovy
+import hudson.tasks.test.AbstractTestResultAction
+import hudson.model.Actionable
+def fileContent
+def azureToken
+
+
+@NonCPS
+def getTestSummary = { ->
+    def testResultAction = currentBuild.rawBuild.getAction(AbstractTestResultAction.class)
+    def summary = ""
+
+    if (testResultAction != null) {
+        def total = testResultAction.getTotalCount()
+        def failed = testResultAction.getFailCount()
+        def skipped = testResultAction.getSkipCount()
+
+        summary = "Test results:\n\t"
+        summary = summary + ("Passed: " + (total - failed - skipped))
+        summary = summary + (", Failed: " + failed)
+        summary = summary + (", Skipped: " + skipped)
+    } else {
+        summary = "No tests found"
+    }
+    return summary
+}
+
+pipeline {
+    options {
+
+        // Console output for the number of recent Pipeline runs
+        buildDiscarder(logRotator(numToKeepStr: '100'))
+
+        // Skip checking out code from source control by default
+        skipDefaultCheckout(true)
+
+        // Generate timestamps for the process procedure
+        timestamps()
+    }
+
+    agent { label 'windows-slave'}
+
+    parameters {
+        string(name: 'gitBranch',defaultValue: "master",description: "Branch to build from. Master builds are tagged by git tag. Others are tagged by branch-commit")
+        choice(name: 'horizonEnvName', choices: ['test5', 'test2', 'staging', 'develop'], description: 'Select environment')
+        string(name: 'testToRun',defaultValue: "DeviceCredentialsTestCase#deleteCredentialsTemplate",description: "tests to run:\n1. All tests - clear text field\n2. All tests in class - name of class\n3. Specific test - className#testName")
+        //string(name: 'groups',defaultValue: "",description: "groups to run separated by comma (if groups set, it overrides testToRun)")
+        choice(name: 'category', choices: ['Sanity', 'Sanity_extra', 'Smoke', 'Regression','Vms_Tests (No devices connected please!!)', '','failed', ''], description: 'Select Category to run')
+        choice(name: 'device_vendor', choices: ['All_Automation_Devices','Axis', 'Panasonic', 'Hanwha', 'Bosch'], description: 'Select devices type to test')
+        booleanParam(defaultValue: false, description: 'Run Sanity_extra category as well?', name: 'sanityExtra')
+        booleanParam(defaultValue: false, description: 'Run headless?', name: 'headless')
+        string(name: 'groups',defaultValue: "Sanity,Regression,failed,Sanity_extra,Vms_Tests,infra,Regression_dont_run,Smoke",description: "group names. Only used for listing all tests tool")
+    }
+
+    triggers {
+        parameterizedCron('''
+            00 23 * * * %category=Sanity;gitBranch=dev
+            30 01 * * * %category=Sanity;gitBranch=master    
+            00 4 * * * %category=Regression;gitBranch=master
+        ''')
+    }
+
+
+    // Clean the job's workspace before starting new one
+    stages {
+
+        stage("pre - clean workspace") {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage("Open rdp - Win slave 2 --> Win slave 1") {
+            steps {
+                build (job: 'launchRdp', parameters: [[$class: 'StringParameterValue', name: 'slave_ip', value: "${env.NODE_NAME}"]], wait: false)
+            }
+        }
+
+        //Pull from git
+        stage("git") {
+            steps {
+                git branch: gitBranch,
+                        credentialsId: 'stbuilduser-git-credentials',
+                        url: 'ssh://git@logan-01.securithings.com:2224/rnd/qa/horizon-automation.git'
+            }
+        }
+
+        stage('setup ssh') {
+            steps {
+                echo 'fetching tunnel credentials'
+                withCredentials([sshUserPrivateKey(credentialsId: 'automation-tests-tunnel', keyFileVariable: 'KEY_PATH', passphraseVariable : 'KEY_PASS', usernameVariable : 'SSH_USER')]) {
+                    echo "adding ssh key to ssh-agent"
+                    bat '''
+                        @echo off
+                        ssh-agent
+                        ssh-add "%KEY_PATH%"
+                        ssh-add -l
+                    '''
+                }
+            }
+        }
+
+        stage("set passwords") {
+            steps {
+                script {
+                    dir("${workspace}") {
+                        def credsId = "automation_${horizonEnvName}_config"
+                        println("CREDS == ${credsId}")
+                        withCredentials([file(credentialsId: "automation_${horizonEnvName}_config", variable: 'FILE')]) {
+                            bat "copy ${FILE} ${workspace}\\${horizonEnvName}.txt"
+                        }
+                        //FW_DOWNLOAD_SECRET
+                        withCredentials([string(credentialsId: 'FW_DOWNLOAD_SECRET', variable: 'TOKEN')]) {
+                            env.azureToken = "${TOKEN}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage("GATEWAY") {
+            steps {
+                script {
+                    def isHeadless = ""
+                    if ("${headless}" == "true")
+                    {
+                        isHeadless = "headless"
+                    }
+
+                    env.ENV = "${horizonEnvName}"
+                    if (!("${testToRun}".contains("SmokeTestCase")) && !("${category}".contains("Smoke"))) {
+                        if ("${category}" != "") {
+                            println("Running Gateway test on environment: ${horizonEnvName}")
+                            currentBuild.displayName = currentBuild.displayName + ".gatewayTest.${horizonEnvName}"
+                            bat "mvn test -Dtest=GatewayTestCase#gatewayTest -Denv=${isHeadless}"
+                        }
+                    }
+                }
+            }
+        }
+
+
+        stage("Testing") { // Run unit tests
+            steps {
+                script {
+                    env.GROUPS=params.groups
+                    env.ENV = "${horizonEnvName}"
+                    def isHeadless = ""
+                    if ("${headless}" == "true")
+                    {
+                        isHeadless = "headless"
+                    }
+
+                    if ("${category}" == "") {
+                        println("Running specific test/s: ${testToRun}")
+                        currentBuild.displayName = currentBuild.displayName + ".${gitBranch}.${testToRun}"
+                        bat "mvn test -Dtest=${testToRun} -Denv=${isHeadless}"
+                    }
+                    else {
+                        env.device_vendor = "${device_vendor}"
+                        env.category = "${category}"
+                        println("Running test category: ${category} on vendor: ${device_vendor}")
+                        currentBuild.displayName = currentBuild.displayName + ".${gitBranch}.${category}"
+                        if (params.sanityExtra) {
+                            echo "ABOUT TO RUN:: mvn test -Dgroups=${category},Sanity_extra -DazureToken=\"${env.azureToken}\" -Denv=${isHeadless}"
+                            bat "mvn test -Dgroups=${category},Sanity_extra -DazureToken=\"${env.azureToken}\" -Denv=${isHeadless}"
+                        } else {
+                            echo "ABOUT TO RUN:: mvn test -Dgroups=${category} -DazureToken=\"${env.azureToken}\" -Denv=${isHeadless}"
+                            bat "mvn test -Dgroups=${category} -DazureToken=\"${env.azureToken}\" -Denv=${isHeadless}"
+                        }
+                        echo 'Maven Done !!'
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                //send slack message if group is smoke
+                def color
+                echo "RESULT == ${currentBuild.result}"
+                if ("${currentBuild.result}" == "SUCCESS") {
+                    color = "#00FF00"
+                }
+                else {
+                    color = "#FF0000"
+                }
+
+                if ("${testToRun}".contains("SmokeTestCase") || "${category}".contains("Smoke")) {
+                    echo "COLLOR == ${color}"
+                    slackSend color: "${color}",
+                            message: "Smoke tests on ${horizonEnvName} finished with: ${currentBuild.result} \n${BUILD_URL}Automation_20Report/  \n${BUILD_URL}console",
+                            channel: "#cicd-notifications"
+                }
+
+                if ("${horizonEnvName}".contains("staging")) {
+                    echo "COLLOR == ${color}"
+                    slackSend color: "${color}",
+                            message: "Sanity tests on ${horizonEnvName} finished with: ${currentBuild.result} \n${BUILD_URL}Automation_20Report/  \n${BUILD_URL}console",
+                            channel: "#qa-program"
+                }
+                try {
+                    //bat 'FOR /f %%G IN (\'query session /sm\') DO tsdiscon %%G'
+                    bat 'tsdiscon'
+                }
+                catch (ex) {
+                    println ("Failed to close RDP " + ex)
+                }
+                try {
+                    //delete passwords file if tests didn't run
+                    echo "workspace = ${workspace}"
+                    echo "horizonEnvName = ${horizonEnvName}"
+                    bat "del ${workspace}\\${horizonEnvName}.txt"
+                }
+                catch (ex) {
+                    println ("delete passwords file if tests didn't run " + ex)
+                }
+
+                try {
+                    bat "taskkill /F /IM chromedriver.exe"
+                }
+                catch (ex) {
+                    println ("taskkill /F /IM chromedriver.exe " + ex)
+                }
+                try {
+                    archiveArtifacts artifacts: 'All_the_tests_we_have.txt', fingerprint: true
+                }
+                catch (ex) {
+                }
+                try {
+                    archiveArtifacts artifacts: 'badDevices.txt', fingerprint: true
+                }
+                catch (ex) {
+                    println "archiveArtifacts badDevices.txt: " + ex
+                }
+                try {
+                    archiveArtifacts artifacts: 'video/*.avi', fingerprint: true
+
+                }
+                catch (ex) {
+                    println "archiveArtifacts video/*.avi: " + ex
+                }
+                try {
+                    archiveArtifacts artifacts: 'video/*.png', fingerprint: true
+                }
+                catch (ex) {
+                    println "archiveArtifacts video/*.png: " + ex
+                }
+                step([$class: 'Publisher', reportFilenamePattern: '**/testng-results.xml'])
+                try {
+                    publishHTML(target: [
+                            allowMissing         : false,
+                            alwaysLinkToLastBuild: true,
+                            keepAll              : true,
+                            reportDir            : "htmlreports",
+                            reportFiles          : "AutomationReport.html",
+                            reportName           : "Automation Report"
+                    ])
+                } catch (ex) {
+                    println "htmlpublisher: " + ex
+
+                }
+
+                try {
+                    println 'removing tunnel key from ssh-agent'
+                    bat '''
+                        @echo off
+                        ssh-add -D
+                        ssh-add -l
+                        exit 0
+                    '''
+                    println 'removed'
+                } catch (ex) {
+                    println "removing tunnel key from ssh-agent: " + ex
+                }
+            }
+        }
+    }
+}
